@@ -70,7 +70,7 @@ export function usePdfImport() {
 			const imageSpecs = pages.map((page) => {
 				const fileId = generateId() as FileId
 				files.push({
-					mimeType: 'image/png',
+					mimeType: 'image/jpeg',
 					id: fileId,
 					dataURL: page.dataURL as DataURL,
 					created: Date.now(),

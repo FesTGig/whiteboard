@@ -4,9 +4,13 @@
  */
 
 import logger from './logger.ts'
+import { applyPromiseTryPolyfill } from './promiseTryPolyfill.ts'
 
 /** Longer edge of a rendered page, in pixels. */
-export const MAX_PAGE_DIMENSION_PX = 2000
+export const MAX_PAGE_DIMENSION_PX = 1600
+
+/** JPEG quality (0-1) used when encoding a rendered page. */
+export const JPEG_QUALITY = 0.85
 
 /** Hard cap on the number of pages rendered from a single PDF. */
 export const MAX_PDF_PAGES = 20
@@ -71,7 +75,7 @@ export function getPagesToRender(totalPages: number, maxPages: number = MAX_PDF_
 
 /**
  * Scale factor to apply to a page so its longer edge is MAX_PAGE_DIMENSION_PX.
- * Pure so the 2000px cap can be tested against real page dimensions without rendering.
+ * Pure so the dimension cap can be tested against real page dimensions without rendering.
  *
  * @param baseWidth - Page width at scale 1 (72 DPI), in points.
  * @param baseHeight - Page height at scale 1 (72 DPI), in points.
@@ -82,7 +86,7 @@ export function getPageRenderScale(baseWidth: number, baseHeight: number, maxDim
 }
 
 /**
- * Renders the pages of a PDF file to PNG data URLs, sized so each page's
+ * Renders the pages of a PDF file to JPEG data URLs, sized so each page's
  * longer edge is MAX_PAGE_DIMENSION_PX. Renders at most MAX_PDF_PAGES pages.
  * pdfjs-dist is imported lazily so it never lands in the main bundle.
  *
@@ -93,20 +97,23 @@ export async function pdfToImages(
 	file: File,
 	onProgress?: (pageNumber: number, pagesToRender: number, totalPages: number) => void,
 ): Promise<PdfToImagesResult> {
-	// Pinned: pdfjs-dist >=4.9.155 (incl. all of 5.x/6.x, both the legacy and
-	// non-legacy builds) uses Promise.try in the worker's message handler,
-	// which is newer than part of Nextcloud's supported browser range (e.g.
-	// Firefox <132, Safari <18.4) and crashes the worker on load with no
-	// visible error. 4.9.124 is the last version before that. The legacy
-	// build is still used on top of that pin for its wider DOM API coverage.
-	const [pdfjsLib, workerModule] = await Promise.all([
-		import('pdfjs-dist/legacy/build/pdf.mjs'),
-		import('pdfjs-dist/legacy/build/pdf.worker.min.mjs?url'),
-	])
-	pdfjsLib.GlobalWorkerOptions.workerSrc = workerModule.default
+	// pdfjs-dist's main module also uses Promise.try, not just the worker -
+	// see applyPromiseTryPolyfill's doc comment for the full rationale. This
+	// runs on the main thread, so unlike the worker's copy it can be a
+	// plain top-level call - it just has to run before the dynamic import
+	// below.
+	applyPromiseTryPolyfill()
+
+	const pdfjsLib = await import('pdfjs-dist/legacy/build/pdf.mjs')
+
+	// Our own worker entry (not pdfjs-dist's workerSrc/GlobalWorkerOptions
+	// mechanism) so the Promise.try polyfill can run inside the worker
+	// before pdf.worker.min.mjs's own code does - see pdfWorkerEntry.ts.
+	const workerPort = new Worker(new URL('../workers/pdfWorkerEntry.ts', import.meta.url), { type: 'module' })
+	const pdfWorker = pdfjsLib.PDFWorker.create({ port: workerPort })
 
 	const data = new Uint8Array(await file.arrayBuffer())
-	const loadingTask = pdfjsLib.getDocument({ data })
+	const loadingTask = pdfjsLib.getDocument({ data, worker: pdfWorker })
 
 	try {
 		const pdf = await withTimeout(
@@ -130,19 +137,18 @@ export async function pdfToImages(
 				const canvas = document.createElement('canvas')
 				canvas.width = Math.round(viewport.width)
 				canvas.height = Math.round(viewport.height)
-				const canvasContext = canvas.getContext('2d')
-				if (!canvasContext) {
-					throw new Error(`Could not get a 2D canvas context for page ${pageNumber}.`)
-				}
 
 				await withTimeout(
-					page.render({ canvasContext, viewport }).promise,
+					// JPEG has no transparency, so any part of the page the PDF
+					// leaves uncovered would otherwise turn black instead of
+					// staying page-white.
+					page.render({ canvas, viewport, background: '#ffffff' }).promise,
 					PAGE_RENDER_TIMEOUT_MS,
 					`Timed out rendering page ${pageNumber}.`,
 				)
 
 				pages.push({
-					dataURL: canvas.toDataURL('image/png'),
+					dataURL: canvas.toDataURL('image/jpeg', JPEG_QUALITY),
 					width: canvas.width,
 					height: canvas.height,
 					pageNumber,
