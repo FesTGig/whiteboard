@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
 
+import logger from './logger.ts'
+
 /** Longer edge of a rendered page, in pixels. */
 export const MAX_PAGE_DIMENSION_PX = 2000
 
@@ -19,6 +21,41 @@ export interface PdfPageImage {
 export interface PdfToImagesResult {
 	pages: PdfPageImage[]
 	totalPages: number
+}
+
+/** How long to wait for the PDF worker to open the document before giving up. */
+export const DOCUMENT_LOAD_TIMEOUT_MS = 20_000
+
+/** How long to wait for the worker to tear down before giving up on cleanup. */
+export const WORKER_DESTROY_TIMEOUT_MS = 5_000
+
+/** How long to wait for a single page to render before giving up. */
+export const PAGE_RENDER_TIMEOUT_MS = 15_000
+
+/**
+ * Rejects with `message` if `promise` hasn't settled within `timeoutMs`.
+ * Needed because a pdf.js worker that fails during its own startup (e.g. a
+ * script error) never resolves or rejects `getDocument().promise` - it just
+ * hangs, leaving the caller with no way to tell the user anything went wrong.
+ *
+ * @param promise - The promise to race against the timeout.
+ * @param timeoutMs - Timeout in milliseconds.
+ * @param message - Error message to reject with if the timeout wins.
+ */
+export function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+	return new Promise<T>((resolve, reject) => {
+		const timer = setTimeout(() => reject(new Error(message)), timeoutMs)
+		promise.then(
+			(value) => {
+				clearTimeout(timer)
+				resolve(value)
+			},
+			(error) => {
+				clearTimeout(timer)
+				reject(error)
+			},
+		)
+	})
 }
 
 /**
@@ -56,9 +93,15 @@ export async function pdfToImages(
 	file: File,
 	onProgress?: (pageNumber: number, pagesToRender: number, totalPages: number) => void,
 ): Promise<PdfToImagesResult> {
+	// Pinned: pdfjs-dist >=4.9.155 (incl. all of 5.x/6.x, both the legacy and
+	// non-legacy builds) uses Promise.try in the worker's message handler,
+	// which is newer than part of Nextcloud's supported browser range (e.g.
+	// Firefox <132, Safari <18.4) and crashes the worker on load with no
+	// visible error. 4.9.124 is the last version before that. The legacy
+	// build is still used on top of that pin for its wider DOM API coverage.
 	const [pdfjsLib, workerModule] = await Promise.all([
-		import('pdfjs-dist'),
-		import('pdfjs-dist/build/pdf.worker.min.mjs?url'),
+		import('pdfjs-dist/legacy/build/pdf.mjs'),
+		import('pdfjs-dist/legacy/build/pdf.worker.min.mjs?url'),
 	])
 	pdfjsLib.GlobalWorkerOptions.workerSrc = workerModule.default
 
@@ -66,7 +109,11 @@ export async function pdfToImages(
 	const loadingTask = pdfjsLib.getDocument({ data })
 
 	try {
-		const pdf = await loadingTask.promise
+		const pdf = await withTimeout(
+			loadingTask.promise,
+			DOCUMENT_LOAD_TIMEOUT_MS,
+			'Timed out waiting for the PDF worker to open the document.',
+		)
 		const totalPages = pdf.numPages
 		const pagesToRender = getPagesToRender(totalPages)
 		const pages: PdfPageImage[] = []
@@ -83,8 +130,16 @@ export async function pdfToImages(
 				const canvas = document.createElement('canvas')
 				canvas.width = Math.round(viewport.width)
 				canvas.height = Math.round(viewport.height)
+				const canvasContext = canvas.getContext('2d')
+				if (!canvasContext) {
+					throw new Error(`Could not get a 2D canvas context for page ${pageNumber}.`)
+				}
 
-				await page.render({ canvas, viewport }).promise
+				await withTimeout(
+					page.render({ canvasContext, viewport }).promise,
+					PAGE_RENDER_TIMEOUT_MS,
+					`Timed out rendering page ${pageNumber}.`,
+				)
 
 				pages.push({
 					dataURL: canvas.toDataURL('image/png'),
@@ -101,6 +156,13 @@ export async function pdfToImages(
 
 		return { pages, totalPages }
 	} finally {
-		await loadingTask.destroy()
+		// destroy() awaits the same internal setup chain as loadingTask.promise,
+		// so a worker stuck in the failure mode above would hang here too -
+		// bound it as well, and never let cleanup mask the real result/error.
+		try {
+			await withTimeout(loadingTask.destroy(), WORKER_DESTROY_TIMEOUT_MS, 'Timed out destroying the PDF worker.')
+		} catch (error) {
+			logger.warn('[pdfToImages] Failed to cleanly destroy the PDF loading task', error)
+		}
 	}
 }

@@ -7,7 +7,7 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs'
 import { describe, expect, it } from 'vitest'
-import { getPageRenderScale, getPagesToRender, MAX_PAGE_DIMENSION_PX, MAX_PDF_PAGES } from '../../src/utils/pdfToImages.ts'
+import { getPageRenderScale, getPagesToRender, MAX_PAGE_DIMENSION_PX, MAX_PDF_PAGES, withTimeout } from '../../src/utils/pdfToImages.ts'
 
 // Hand-built minimal PDF, two 300x150pt pages, no fonts/content streams needed.
 const fixturePath = fileURLToPath(new URL('./fixtures/two-page.pdf', import.meta.url))
@@ -62,5 +62,20 @@ describe('getPageRenderScale against a real PDF', () => {
 		} finally {
 			await loadingTask.destroy()
 		}
+	})
+})
+
+describe('withTimeout', () => {
+	it('resolves with the value when the promise settles before the timeout', async () => {
+		await expect(withTimeout(Promise.resolve('done'), 50, 'timed out')).resolves.toBe('done')
+	})
+
+	it('rejects with the original error when the promise rejects before the timeout', async () => {
+		await expect(withTimeout(Promise.reject(new Error('boom')), 50, 'timed out')).rejects.toThrow('boom')
+	})
+
+	it('rejects with the timeout message when the promise never settles', async () => {
+		const neverSettles = new Promise(() => {})
+		await expect(withTimeout(neverSettles, 10, 'timed out')).rejects.toThrow('timed out')
 	})
 })

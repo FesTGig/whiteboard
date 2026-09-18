@@ -119,6 +119,15 @@ export function usePdfImport() {
 	}, [importPdfFile])
 
 	useEffect(() => {
+		// excalidrawAPI is only set after Excalidraw has actually mounted, so
+		// this is what makes the effect re-run once .excalidraw-wrapper
+		// exists - on the very first render (isLoading, before Excalidraw
+		// mounts) the wrapper isn't in the DOM yet and a one-shot effect
+		// would silently never attach the listener.
+		if (!excalidrawAPI) {
+			return
+		}
+
 		const wrapper = document.getElementsByClassName('excalidraw-wrapper')[0] as HTMLElement | undefined
 		if (!wrapper) {
 			return
@@ -139,7 +148,7 @@ export function usePdfImport() {
 		// handler runs, so non-PDF drops are unaffected.
 		wrapper.addEventListener('drop', handleDrop, true)
 		return () => wrapper.removeEventListener('drop', handleDrop, true)
-	}, [])
+	}, [excalidrawAPI])
 
 	const openImportDialog = useCallback(() => {
 		const input = document.createElement('input')
