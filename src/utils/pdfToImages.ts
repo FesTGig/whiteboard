@@ -110,6 +110,29 @@ export async function pdfToImages(
 	// mechanism) so the Promise.try polyfill can run inside the worker
 	// before pdf.worker.min.mjs's own code does - see pdfWorkerEntry.ts.
 	const workerPort = new Worker(new URL('../workers/pdfWorkerEntry.ts', import.meta.url), { type: 'module' })
+
+	// A worker that fails to load or start (blocked script, CSP violation,
+	// syntax error, ...) never sends pdfjs-dist's "test"/"ready" handshake,
+	// so getDocument().promise just hangs - previously surfacing only as a
+	// generic timeout with no indication of what actually went wrong. These
+	// fire on genuine worker-level failures (not on anything pdfjs-dist
+	// itself reports through its own message protocol), so always log them,
+	// and race them into the initial load so a real worker failure surfaces
+	// immediately instead of waiting out the full timeout.
+	const workerFailure = new Promise<never>((_resolve, reject) => {
+		workerPort.onerror = (event) => {
+			logger.error('[pdfToImages] PDF worker script error', event)
+			reject(new Error(`PDF worker failed to start: ${event.message || 'unknown error'}`))
+		}
+		workerPort.onmessageerror = (event) => {
+			logger.error('[pdfToImages] PDF worker message error (could not deserialize)', event)
+			reject(new Error('PDF worker sent a message that could not be deserialized.'))
+		}
+	})
+	// Nothing should ever settle this promise by resolving, only logging -
+	// silence an "unhandled rejection" style warning if it's never raced.
+	workerFailure.catch(() => {})
+
 	const pdfWorker = pdfjsLib.PDFWorker.create({ port: workerPort })
 
 	const data = new Uint8Array(await file.arrayBuffer())
@@ -117,7 +140,7 @@ export async function pdfToImages(
 
 	try {
 		const pdf = await withTimeout(
-			loadingTask.promise,
+			Promise.race([loadingTask.promise, workerFailure]),
 			DOCUMENT_LOAD_TIMEOUT_MS,
 			'Timed out waiting for the PDF worker to open the document.',
 		)

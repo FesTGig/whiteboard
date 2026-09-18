@@ -3,21 +3,23 @@
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
 
-import { applyPromiseTryPolyfill } from '../utils/promiseTryPolyfill.ts'
-
-// Must run before pdf.worker.min.mjs's own top-level code - see
-// applyPromiseTryPolyfill's doc comment for why. That's also why the
-// worker script below is a dynamic import rather than a static one:
-// static imports are evaluated before the importing module's own
-// top-level code, which would run the real worker script first and
-// defeat the polyfill.
-applyPromiseTryPolyfill()
-
-// Not awaited: the dynamic import() call itself already only starts
-// evaluating pdf.worker.min.mjs after the synchronous polyfill call above
-// has completed, which is the only ordering guarantee needed here. Not
-// awaiting also avoids top-level await, which the build target (part of
-// Nextcloud's supported browser range predates ES2022) doesn't support.
-// @ts-expect-error - side-effect-only script (sets up its own message
-// handler on `self`), pdfjs-dist ships no type declarations for it.
-void import('pdfjs-dist/legacy/build/pdf.worker.min.mjs')
+// Both plain static imports, deliberately not a dynamic import() of
+// pdf.worker.min.mjs: this worker's CSP is inherited from the page, and
+// while worker-src 'self' (added by AddContentSecurityPolicyListener)
+// covers *loading this worker script itself*, a dynamic import() of a
+// further script from inside that worker falls under script-src-elem
+// instead, which requires 'strict-dynamic'/nonce trust that a bare
+// runtime import() inside a worker has no way to carry. Static imports
+// don't have this problem: they're part of the same build-time module
+// graph, so Rollup bundles pdf.worker.min.mjs straight into this file -
+// same shape as the already-working syncWorker.ts, which has no runtime
+// imports of its own either.
+//
+// Sibling static imports of the same module evaluate in the order
+// they're written, each one fully before the next starts - so this
+// import ordering is what guarantees the polyfill runs before
+// pdf.worker.min.mjs's own top-level code does. See
+// applyPromiseTryPolyfillOnImport.ts and promiseTryPolyfill.ts for why
+// that matters.
+import '../utils/applyPromiseTryPolyfillOnImport.ts'
+import 'pdfjs-dist/legacy/build/pdf.worker.min.mjs'
