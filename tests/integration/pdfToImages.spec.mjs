@@ -7,7 +7,7 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs'
 import { describe, expect, it } from 'vitest'
-import { getPageRenderScale, getPagesToRender, MAX_PAGE_DIMENSION_PX, MAX_PDF_PAGES, withTimeout } from '../../src/utils/pdfToImages.ts'
+import { getPageRenderScale, getPagesToRender, MAX_PAGE_DIMENSION_PX, MAX_PDF_PAGES, pickSmallerEncoding, withTimeout } from '../../src/utils/pdfToImages.ts'
 
 // Hand-built minimal PDF, two 300x150pt pages, no fonts/content streams needed.
 const fixturePath = fileURLToPath(new URL('./fixtures/two-page.pdf', import.meta.url))
@@ -62,6 +62,29 @@ describe('getPageRenderScale against a real PDF', () => {
 		} finally {
 			await loadingTask.destroy()
 		}
+	})
+})
+
+describe('pickSmallerEncoding', () => {
+	it('keeps the PNG when it is smaller (typical for flat vector content)', () => {
+		const png = 'data:image/png;base64,AAAA'
+		const jpeg = 'data:image/jpeg;base64,AAAAAAAAAAAAAAAA'
+
+		expect(pickSmallerEncoding(png, jpeg)).toEqual({ dataURL: png, mimeType: 'image/png' })
+	})
+
+	it('keeps the JPEG when it is smaller (typical for photographic content)', () => {
+		const png = 'data:image/png;base64,AAAAAAAAAAAAAAAA'
+		const jpeg = 'data:image/jpeg;base64,AAAA'
+
+		expect(pickSmallerEncoding(png, jpeg)).toEqual({ dataURL: jpeg, mimeType: 'image/jpeg' })
+	})
+
+	it('keeps the PNG on a tie', () => {
+		const png = 'data:image/png;base64,AAAA'
+		const jpeg = 'data:image/jpeg;base64,BBBB'
+
+		expect(pickSmallerEncoding(png, jpeg)).toEqual({ dataURL: png, mimeType: 'image/png' })
 	})
 })
 

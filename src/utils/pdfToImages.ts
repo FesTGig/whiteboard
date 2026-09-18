@@ -17,6 +17,7 @@ export const MAX_PDF_PAGES = 20
 
 export interface PdfPageImage {
 	dataURL: string
+	mimeType: 'image/png' | 'image/jpeg'
 	width: number
 	height: number
 	pageNumber: number
@@ -85,16 +86,43 @@ export function getPageRenderScale(baseWidth: number, baseHeight: number, maxDim
 	return maxDimension / Math.max(baseWidth, baseHeight)
 }
 
+export interface PickedEncoding {
+	dataURL: string
+	mimeType: 'image/png' | 'image/jpeg'
+}
+
 /**
- * Renders the pages of a PDF file to JPEG data URLs, sized so each page's
- * longer edge is MAX_PAGE_DIMENSION_PX. Renders at most MAX_PDF_PAGES pages.
- * pdfjs-dist is imported lazily so it never lands in the main bundle.
+ * Picks whichever of a page's two renderings has the smaller data URL.
+ * Pure so the choice can be tested without rendering: PNG usually wins for
+ * flat vector content (solid shapes, text, no gradients), JPEG usually
+ * wins for photographic/raster content - which one is smaller depends on
+ * the page, not the file format, so both are always rendered and compared.
  *
- * @param file - The PDF file to render.
+ * @param pngDataURL - The same page rendered and encoded as PNG.
+ * @param jpegDataURL - The same page rendered and encoded as JPEG.
+ */
+export function pickSmallerEncoding(pngDataURL: string, jpegDataURL: string): PickedEncoding {
+	return pngDataURL.length <= jpegDataURL.length
+		? { dataURL: pngDataURL, mimeType: 'image/png' }
+		: { dataURL: jpegDataURL, mimeType: 'image/jpeg' }
+}
+
+/**
+ * Renders the pages of a PDF file to data URLs, sized so each page's longer
+ * edge is MAX_PAGE_DIMENSION_PX. Each page is encoded as both PNG and JPEG
+ * and the smaller one is kept - see pickSmallerEncoding. Renders at most
+ * MAX_PDF_PAGES pages. pdfjs-dist is imported lazily so it never lands in
+ * the main bundle.
+ *
+ * @param pdfData - The raw bytes of the PDF file to render. Takes an
+ *   ArrayBuffer rather than a File so callers can read it eagerly, right
+ *   where the file was picked/dropped - a cloud-sync placeholder file's
+ *   read can start failing with NotReadableError if too much unrelated
+ *   async work (like the dynamic imports below) happens first.
  * @param onProgress - Called once before rendering starts (pageNumber 0, so callers can detect truncation early) and again after each page is rendered.
  */
 export async function pdfToImages(
-	file: File,
+	pdfData: ArrayBuffer,
 	onProgress?: (pageNumber: number, pagesToRender: number, totalPages: number) => void,
 ): Promise<PdfToImagesResult> {
 	// pdfjs-dist's main module also uses Promise.try, not just the worker -
@@ -135,7 +163,7 @@ export async function pdfToImages(
 
 	const pdfWorker = pdfjsLib.PDFWorker.create({ port: workerPort })
 
-	const data = new Uint8Array(await file.arrayBuffer())
+	const data = new Uint8Array(pdfData)
 	const loadingTask = pdfjsLib.getDocument({ data, worker: pdfWorker })
 
 	try {
@@ -170,8 +198,14 @@ export async function pdfToImages(
 					`Timed out rendering page ${pageNumber}.`,
 				)
 
+				const { dataURL, mimeType } = pickSmallerEncoding(
+					canvas.toDataURL('image/png'),
+					canvas.toDataURL('image/jpeg', JPEG_QUALITY),
+				)
+
 				pages.push({
-					dataURL: canvas.toDataURL('image/jpeg', JPEG_QUALITY),
+					dataURL,
+					mimeType,
 					width: canvas.width,
 					height: canvas.height,
 					pageNumber,
@@ -192,6 +226,20 @@ export async function pdfToImages(
 			await withTimeout(loadingTask.destroy(), WORKER_DESTROY_TIMEOUT_MS, 'Timed out destroying the PDF worker.')
 		} catch (error) {
 			logger.warn('[pdfToImages] Failed to cleanly destroy the PDF loading task', error)
+		}
+
+		// loadingTask.destroy() above calls PDFWorker#destroy(), but that
+		// only terminates a worker pdfjs-dist created itself - for a port we
+		// hand it ourselves (PDFWorker.create({ port })), it only clears its
+		// own bookkeeping and never calls .terminate() on the port (checked
+		// against the installed pdfjs-dist source: PDFWorker keeps a
+		// separate #webWorker field for its own workers and only terminates
+		// that one; ours lives in #port, which destroy() just discards).
+		// Without this, every import leaks a live worker thread.
+		try {
+			workerPort.terminate()
+		} catch (error) {
+			logger.warn('[pdfToImages] Failed to terminate the PDF worker', error)
 		}
 	}
 }

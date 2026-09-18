@@ -31,7 +31,7 @@ export function usePdfImport() {
 		isReadOnly: state.isReadOnly,
 	})))
 
-	const importPdfFile = useCallback(async (file: File) => {
+	const importPdfFile = useCallback(async (fileName: string, data: ArrayBuffer) => {
 		if (!excalidrawAPI || isReadOnly) {
 			return
 		}
@@ -39,17 +39,17 @@ export function usePdfImport() {
 		const toastState: { current: ReturnType<typeof showLoading> | null } = { current: null }
 
 		try {
-			const { pages } = await pdfToImages(file, (pageNumber, pagesToRender, totalPages) => {
+			const { pages } = await pdfToImages(data, (pageNumber, pagesToRender, totalPages) => {
 				toastState.current?.hideToast()
 				toastState.current = pageNumber === 0 && totalPages > pagesToRender
 					? showLoading(t('whiteboard', 'Importing the first {count} of {total} pages from "{name}" (maximum is {max})…', {
 							count: pagesToRender,
 							total: totalPages,
-							name: file.name,
+							name: fileName,
 							max: MAX_PDF_PAGES,
 						}), { timeout: -1 })
 					: showLoading(t('whiteboard', 'Importing "{name}"… ({current}/{total})', {
-							name: file.name,
+							name: fileName,
 							current: Math.max(pageNumber, 1),
 							total: pagesToRender,
 						}), { timeout: -1 })
@@ -58,7 +58,7 @@ export function usePdfImport() {
 			toastState.current?.hideToast()
 
 			if (pages.length === 0) {
-				showError(t('whiteboard', 'The PDF "{name}" has no pages to import.', { name: file.name }))
+				showError(t('whiteboard', 'The PDF "{name}" has no pages to import.', { name: fileName }))
 				return
 			}
 
@@ -70,7 +70,7 @@ export function usePdfImport() {
 			const imageSpecs = pages.map((page) => {
 				const fileId = generateId() as FileId
 				files.push({
-					mimeType: 'image/jpeg',
+					mimeType: page.mimeType,
 					id: fileId,
 					dataURL: page.dataURL as DataURL,
 					created: Date.now(),
@@ -102,12 +102,12 @@ export function usePdfImport() {
 
 			showSuccess(t('whiteboard', 'Imported {count} PDF pages from "{name}".', {
 				count: pages.length,
-				name: file.name,
+				name: fileName,
 			}))
 		} catch (error) {
 			toastState.current?.hideToast()
 			showError(t('whiteboard', 'Could not import PDF "{name}": {message}', {
-				name: file.name,
+				name: fileName,
 				message: error instanceof Error ? error.message : String(error),
 			}))
 		}
@@ -117,6 +117,32 @@ export function usePdfImport() {
 	useEffect(() => {
 		importPdfFileRef.current = importPdfFile
 	}, [importPdfFile])
+
+	// Reads a File picked from a cloud-sync placeholder (e.g. an
+	// on-demand/"online-only" Dropbox or OneDrive file that hasn't been
+	// downloaded yet) can fail with NotReadableError, and reliably does if
+	// too much unrelated async work (importing pdfjs-dist, creating the
+	// worker, ...) happens between the drop/pick and the read - so this
+	// reads the file immediately, as the very first thing done with it,
+	// before any of that.
+	const readFileAndImport = useCallback(async (file: File) => {
+		let data: ArrayBuffer
+		try {
+			data = await file.arrayBuffer()
+		} catch (error) {
+			if (error instanceof DOMException && error.name === 'NotReadableError') {
+				showError(t('whiteboard', 'The file could not be read. Make sure it is fully downloaded and still exists.'))
+			} else {
+				showError(t('whiteboard', 'Could not read "{name}": {message}', {
+					name: file.name,
+					message: error instanceof Error ? error.message : String(error),
+				}))
+			}
+			return
+		}
+
+		await importPdfFileRef.current(file.name, data)
+	}, [])
 
 	useEffect(() => {
 		// excalidrawAPI is only set after Excalidraw has actually mounted, so
@@ -141,14 +167,14 @@ export function usePdfImport() {
 
 			ev.preventDefault()
 			ev.stopPropagation()
-			void importPdfFileRef.current(file)
+			void readFileAndImport(file)
 		}
 
 		// Capture phase: decide before Excalidraw's own (bubble-phase) drop
 		// handler runs, so non-PDF drops are unaffected.
 		wrapper.addEventListener('drop', handleDrop, true)
 		return () => wrapper.removeEventListener('drop', handleDrop, true)
-	}, [excalidrawAPI])
+	}, [excalidrawAPI, readFileAndImport])
 
 	const openImportDialog = useCallback(() => {
 		const input = document.createElement('input')
@@ -158,13 +184,13 @@ export function usePdfImport() {
 		input.addEventListener('change', () => {
 			const file = input.files?.[0]
 			if (file) {
-				void importPdfFileRef.current(file)
+				void readFileAndImport(file)
 			}
 			input.remove()
 		})
 		document.body.appendChild(input)
 		input.click()
-	}, [])
+	}, [readFileAndImport])
 
 	return { openImportDialog: isReadOnly ? undefined : openImportDialog }
 }
